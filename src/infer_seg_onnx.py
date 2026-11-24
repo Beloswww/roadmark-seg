@@ -18,7 +18,7 @@ ap = argparse.ArgumentParser()
 ap.add_argument("mode", choices=["video", "probe", "shots", "image"])
 ap.add_argument("video", help="path to the video; in image mode, path to the image")
 ap.add_argument("rest", nargs="*", help="mode-dependent: frame range, frame list, or more images")
-ap.add_argument("--cls", default="SL", help="class ids or abbreviations, comma separated; 'all' for every class. Each class uses its own parameters")
+ap.add_argument("--cls", default=None, help="class ids or abbreviations, comma separated; 'all' for every class. Each class uses its own parameters")
 ap.add_argument("--head", default="fine", choices=["fine", "coarse"],
                 help="which segmentation head to read")
 ap.add_argument("--infer", type=int, default=C.INFER_H, help="inference short side")
@@ -33,8 +33,21 @@ ap.add_argument("--box", default="bbox", choices=["bbox", "rbox", "both"],
                 help="which box form to draw (all three are always written to the json)")
 ap.add_argument("--all", action="store_true", help="keep every detection per class, not just one")
 ap.add_argument("--no-suppress", action="store_true", help="disable cross-class suppression (see segcfg.SUPPRESS)")
-ap.add_argument("--mask", action="store_true", help="image mode: overlay the mask of every class, ignoring the box thresholds")
+ap.add_argument("--mask", action="store_true", help="image mode: overlay the mask of every class on top of the box render. Superseded by --render seg, which is the proper segmentation output")
 ap.add_argument("--sup-gap", type=int, default=None, help="minimum gap in px used for suppression, overriding the default")
+ap.add_argument("--render", default="box", choices=["box", "seg", "both"],
+                help="box: detection boxes only (default). seg: raw semantic "
+                     "segmentation, no box post-processing at all. both: boxes on "
+                     "top of the segmentation")
+ap.add_argument("--seg-style", default="overlay", choices=["overlay", "mask"],
+                help="seg rendering: blend the palette over the frame, or draw it on "
+                     "black with no frame underneath")
+ap.add_argument("--legend", action="store_true",
+                help="draw a colour key for the classes present in the frame")
+ap.add_argument("--save-raw", action="store_true",
+                help="also write the per-pixel class ids (<name>_cls.png, 8-bit, pixel "
+                     "value = class id) and the confidence map (<name>_conf.png, "
+                     "0-255 = 0.0-1.0). video mode writes a png sequence")
 ap.add_argument("--out", default=None, help="output directory (shots / image modes)")
 ap.add_argument("--tag", default="", help="filename prefix for written images")
 # If given, these override the preset for EVERY class; otherwise each class keeps its own
@@ -47,13 +60,21 @@ for f, t in (("pick", str), ("min-area", int), ("min-w", int), ("min-ar", float)
     ap.add_argument(f"--{f}", type=t, default=None, help=f"override for ALL classes: {_OV[f]}")
 a = ap.parse_args()
 
-CLS = C.ids(a.cls)
-CFG = {c: C.cfg(c, pick=a.pick, min_area=a.min_area, min_w=a.min_w, min_ar=a.min_ar,
-                close_w=a.close_w, close_h=a.close_h) for c in CLS}
-for c in CLS:
+# --cls means "the classes I care about" in every mode. Segmentation has no geometric
+# thresholds to fall foul of, so it defaults to every class; boxes default to stop line.
+BOXING = a.render in ("box", "both")
+CLS = C.ids(a.cls if a.cls is not None else ("SL" if BOXING else "all"))
+print(f"render={a.render}" + (f" style={a.seg_style}" if a.render != "box" else "")
+      + f"  classes: " + ",".join(C.ABBR_OF[c] for c in CLS))
+
+# Box post-processing parameters are only meaningful when boxes are actually produced.
+CFG = ({c: C.cfg(c, pick=a.pick, min_area=a.min_area, min_w=a.min_w, min_ar=a.min_ar,
+                 close_w=a.close_w, close_h=a.close_h) for c in CLS} if BOXING else {})
+for c in CFG:
     print(C.describe(c, CFG[c]) + f"  box-colour-BGR={CFG[c]['col']}")
 
-SUP = {} if a.no_suppress else {c: dict(C.SUPPRESS[c]) for c in CLS if c in C.SUPPRESS}
+SUP = ({c: dict(C.SUPPRESS[c]) for c in CLS if c in C.SUPPRESS}
+       if BOXING and not a.no_suppress else {})
 for c in SUP:
     if a.sup_gap is not None:
         SUP[c]["min_gap"] = a.sup_gap
@@ -86,15 +107,77 @@ def boxes(cid, pred, prob):
     return out if a.all else out[:1]
 
 
-def draw(fr, pred, prob, per, conf):
-    """per: {cid: [box, ...]}; conf: {cid: bool}. With --clean, draw only boxes and
-    class names -- no mask overlay, no confidence value."""
+def seg_image(fr, pred, prob):
+    """Raw semantic segmentation, with no box post-processing whatsoever: every pixel of
+    every selected class above --conf gets its palette colour. This is the model output
+    itself, unlike the --render box overlay, which only paints classes that survived the
+    area / width / aspect-ratio filters."""
+    m = np.isin(pred, CLS) & (prob >= a.conf)
+    if a.seg_style == "mask":
+        vis = np.zeros_like(fr)
+        vis[m] = C.PALETTE[pred[m]]
+        return vis
     vis = fr.copy()
-    if not a.clean:
-        m = np.isin(pred, [c for c in CLS if per.get(c)]) & (prob >= a.conf)
-        if m.any():
-            vis[m] = (0.55 * C.PALETTE[pred[m]] + 0.45 * vis[m]).astype(np.uint8)
-    for cid in CLS:
+    if m.any():
+        vis[m] = (0.55 * C.PALETTE[pred[m]] + 0.45 * vis[m]).astype(np.uint8)
+    return vis
+
+
+def draw_legend(vis, pred, prob, minpx=300):
+    """Colour key for the classes actually present -- a 25-colour mask is unreadable
+    without one. Sorted by pixel count, largest first."""
+    m = prob >= a.conf
+    uid, cnt = np.unique(pred[m], return_counts=True)
+    items = sorted(((int(i), int(c)) for i, c in zip(uid, cnt) if i != 0 and c >= minpx),
+                   key=lambda t: -t[1])
+    if not items:
+        return vis
+    pad, box, lh = 10, 18, 26
+    w = 34 + max(cv2.getTextSize(C.NAME[i], 0, 0.6, 1)[0][0] for i, _ in items)
+    h = pad * 2 + lh * len(items)
+    cv2.rectangle(vis, (pad, pad), (pad + w, pad + h), (0, 0, 0), -1)
+    for k, (i, _) in enumerate(items):
+        y = pad * 2 + lh * k
+        cv2.rectangle(vis, (pad + 8, y), (pad + 8 + box, y + box),
+                      tuple(int(v) for v in C.PALETTE[i]), -1)
+        cv2.putText(vis, C.NAME[i], (pad + 34, y + box - 3), 0, 0.6, (255, 255, 255), 1)
+    return vis
+
+
+# A flat-colour mask would pick up visible ringing from jpeg, so write those as png.
+# Blended overlays and the original frame are photographic, where jpeg is fine.
+LOSSLESS = a.render != "box" and a.seg_style == "mask"
+EXT = ".png" if LOSSLESS else ".jpg"
+
+
+def save_vis(stem, vis):
+    cv2.imwrite(stem + EXT, vis,
+                [] if LOSSLESS else [cv2.IMWRITE_JPEG_QUALITY, 95])
+    return stem + EXT
+
+
+def save_raw(stem, pred, prob):
+    """Per-pixel class ids and confidences as png, for downstream use.
+    <stem>_cls.png  : 8-bit, pixel value = class id (0 = background)
+    <stem>_conf.png : 8-bit, 0-255 maps to confidence 0.0-1.0"""
+    cv2.imwrite(f"{stem}_cls.png", pred)
+    cv2.imwrite(f"{stem}_conf.png", np.clip(prob * 255, 0, 255).astype(np.uint8))
+
+
+def draw(fr, pred, prob, per, conf):
+    """per: {cid: [box, ...]}; conf: {cid: bool}. Dispatches on --render. With --clean,
+    draw only boxes and class names -- no mask overlay, no confidence value."""
+    if a.render != "box":
+        vis = seg_image(fr, pred, prob)
+    else:
+        vis = fr.copy()
+        if not a.clean:
+            # NB: only classes that produced a box. For the real segmentation output
+            # use --render seg.
+            m = np.isin(pred, [c for c in CLS if per.get(c)]) & (prob >= a.conf)
+            if m.any():
+                vis[m] = (0.55 * C.PALETTE[pred[m]] + 0.45 * vis[m]).astype(np.uint8)
+    for cid in (CLS if a.render in ("box", "both") else []):
         if not conf.get(cid):
             continue
         col = CFG[cid]["col"]
@@ -109,7 +192,7 @@ def draw(fr, pred, prob, per, conf):
             ty = y - 8 if y - th - 14 >= 0 else y + h + th + 10
             cv2.rectangle(vis, (x, ty - th - 8), (x + tw + 12, ty + 6), col, -1)
             cv2.putText(vis, lbl, (x + 6, ty), 0, 0.9, (0, 0, 0), 2)
-    return vis
+    return draw_legend(vis, pred, prob) if a.legend else vis
 
 
 def classes_in(pred, prob, minpx=300):
@@ -132,18 +215,22 @@ if a.mode == "image":
         if fr is None:
             print(f"--- {p}: cannot read (not an image, or wrong path)"); continue
         pred, prob = seg(fr)
-        per = {c: boxes(c, pred, prob) for c in CLS}
-        vis = draw(fr, pred, prob, per, {c: bool(per[c]) for c in CLS})
+        per = {c: boxes(c, pred, prob) for c in CLS} if BOXING else {}
+        vis = draw(fr, pred, prob, per, {c: bool(per.get(c)) for c in CLS})
         if a.mask:                      # overlay every class mask, ignoring the box thresholds
             m = (pred != 0) & (prob >= a.conf)
             if m.any():
                 vis[m] = (0.55 * C.PALETTE[pred[m]] + 0.45 * vis[m]).astype(np.uint8)
         d = a.out or os.path.dirname(os.path.abspath(p))
-        fn = f"{d}/{a.tag}{os.path.splitext(os.path.basename(p))[0]}_seg.jpg"
-        cv2.imwrite(fn, vis, [cv2.IMWRITE_JPEG_QUALITY, 95])
-        json.dump({str(c): per[c] for c in CLS}, open(fn[:-4] + ".json", "w"))
+        stem = f"{d}/{a.tag}{os.path.splitext(os.path.basename(p))[0]}_seg"
+        fn = save_vis(stem, vis)
+        if BOXING:
+            json.dump({str(c): per[c] for c in CLS}, open(stem + ".json", "w"))
+        if a.save_raw:
+            save_raw(stem, pred, prob)
         print(f"--- {os.path.basename(p)}  {fr.shape[1]}x{fr.shape[0]} -> {fn}")
-        print("    boxes: " + "  ".join(f"{C.NAME[c]}:{len(per[c])}" for c in CLS))
+        if BOXING:
+            print("    boxes: " + "  ".join(f"{C.NAME[c]}:{len(per[c])}" for c in CLS))
         classes_in(pred, prob)
     sys.exit()
 
@@ -168,13 +255,17 @@ if a.mode == "shots":
         if not ok:
             print(f"  f{fi}: cannot read frame"); continue
         pred, prob = seg(fr)
-        per = {c: boxes(c, pred, prob) for c in CLS}
-        fn = f"{a.out}/{a.tag}f{fi:05d}.jpg"
-        cv2.imwrite(fn, draw(fr, pred, prob, per, {c: bool(per[c]) for c in CLS}),
-                    [cv2.IMWRITE_JPEG_QUALITY, 95])
-        json.dump(per, open(fn[:-4] + ".json", "w"))
+        per = {c: boxes(c, pred, prob) for c in CLS} if BOXING else {}
+        stem = f"{a.out}/{a.tag}f{fi:05d}"
+        fn = save_vis(stem, draw(fr, pred, prob, per,
+                                 {c: bool(per.get(c)) for c in CLS}))
+        if BOXING:
+            json.dump(per, open(stem + ".json", "w"))
+        if a.save_raw:
+            save_raw(stem, pred, prob)
         print(f"  {os.path.basename(fn)}  " +
-              "  ".join(f"{C.NAME[c]}:{len(per[c])}" for c in CLS))
+              ("  ".join(f"{C.NAME[c]}:{len(per[c])}" for c in CLS) if BOXING
+               else f"{int((pred != 0).sum())}px segmented"))
     cap.release()
     sys.exit()
 
@@ -186,24 +277,39 @@ cap.set(cv2.CAP_PROP_POS_FRAMES, F0)
 vw = cv2.VideoWriter(OUT, cv2.VideoWriter_fourcc(*"mp4v"), a.fps, (W, H))
 hist = {c: collections.deque(maxlen=a.win) for c in CLS}   # temporal confirmation, per class
 rec, nhit = {}, {c: 0 for c in CLS}
+npx = 0
+RAWDIR = OUT.rsplit(".", 1)[0] + "_raw"
+if a.save_raw:
+    os.makedirs(RAWDIR, exist_ok=True)
 for fi in range(F0, F1):
     ok, fr = cap.read()
     if not ok:
         break
     pred, prob = seg(fr)
-    per = {c: boxes(c, pred, prob) for c in CLS}
+    per = {c: boxes(c, pred, prob) for c in CLS} if BOXING else {}
     conf = {}
-    for c in CLS:
+    for c in (CLS if BOXING else []):
         hist[c].append(bool(per[c]))
         conf[c] = sum(hist[c]) >= a.hit
         nhit[c] += conf[c]
-    rec[fi] = {str(c): per[c] for c in CLS if conf[c]}
+    if BOXING:
+        rec[fi] = {str(c): per[c] for c in CLS if conf[c]}
+    else:
+        npx += int(np.isin(pred, CLS).sum())
     vw.write(draw(fr, pred, prob, per, conf))
+    if a.save_raw:
+        save_raw(f"{RAWDIR}/f{fi:05d}", pred, prob)
     if (fi - F0) % 150 == 0:
-        print(f"  f{fi}  " + "  ".join(f"{C.NAME[c]}:{len(per[c])}" for c in CLS), flush=True)
+        print(f"  f{fi}  " + ("  ".join(f"{C.NAME[c]}:{len(per[c])}" for c in CLS)
+                              if BOXING else f"{int(np.isin(pred, CLS).sum())}px"),
+              flush=True)
 vw.release(); cap.release()
-json.dump(rec, open(OUT.rsplit(".", 1)[0] + "_boxes.json", "w"))
+if BOXING:
+    json.dump(rec, open(OUT.rsplit(".", 1)[0] + "_boxes.json", "w"))
 tot = F1 - F0
 print(f"done {OUT}   {tot} frames;  " +
-      ";  ".join(f"{C.NAME[c]} {nhit[c]} frames ({100*nhit[c]/max(tot,1):.1f}%)"
-                 for c in CLS))
+      (";  ".join(f"{C.NAME[c]} {nhit[c]} frames ({100*nhit[c]/max(tot,1):.1f}%)"
+                  for c in CLS) if BOXING
+       else f"mean {npx // max(tot, 1)}px segmented per frame"))
+if a.save_raw:
+    print(f"     per-pixel class ids and confidences in {RAWDIR}/")
