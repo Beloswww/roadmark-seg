@@ -1,8 +1,6 @@
 # 模型權重放這裡
 
-本 repo **不含**模型權重 —— 該模型非本專案所有，未取得公開發布的同意。
-
-請向作者索取 `seg_task_ssl_pb9-3-off.onnx`（約 58 MB），放到這個資料夾底下：
+`seg_task_ssl_pb9-3-off.onnx`（約 58 MB），放到這個資料夾底下：
 
 ```
 model/seg_task_ssl_pb9-3-off.onnx
