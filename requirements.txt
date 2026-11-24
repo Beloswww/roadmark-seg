@@ -1,0 +1,9 @@
+# GPU build (recommended). Needs CUDA 13 + cuDNN 9; pip pulls in the nvidia-* libraries
+# alongside it, and run.sh adds them to LD_LIBRARY_PATH automatically.
+onnxruntime-gpu>=1.32.0
+
+# No NVIDIA GPU? Comment out the line above and use this one instead (about 37x slower):
+# onnxruntime>=1.22.0
+
+numpy>=1.24
+opencv-python>=4.8

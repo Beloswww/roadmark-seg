@@ -1,0 +1,13 @@
+# Model weights are not distributed with this repo (not owned by this project).
+# See model/README.md.
+*.onnx
+
+__pycache__/
+*.py[cod]
+
+# Inference output
+*.mp4
+*.avi
+*_seg.jpg
+*_boxes.json
+out/
